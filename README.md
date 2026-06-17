@@ -4,6 +4,8 @@ A lightweight interactive tool for creating and editing bounding boxes and assig
 
 ---
 
+<img width="1500" height="1000" alt="pharos_bbox_editor_demo" src="https://github.com/user-attachments/assets/54d573ff-f826-4516-a76a-8fe8e9f633c7" />
+
 ## Features
 
 - Create, edit, and refine bounding boxes directly on the image.
