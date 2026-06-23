@@ -72,9 +72,11 @@ CATEGORY_NAMES = {
     3: "Image",
     4: "Table",
     5: "Formula",
-    6: "Footer",
+    6: "Page Number",
     7: "Document Title",
     8: "Footnote",
+    9: "Caption",
+    10: "Document Info",
 }
 
 
