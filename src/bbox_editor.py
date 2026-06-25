@@ -94,6 +94,15 @@ def category_short(cat: int) -> str:
     return CATEGORY_NAMES.get(cat, f"c{cat}")
 
 
+def line_color(color_id: int) -> QColor:
+    """A distinct, pleasant colour per text line (stable per line).
+    Uses golden-ratio hue spacing so neighbouring lines differ clearly."""
+    h = (color_id * 0.6180339887498949) % 1.0
+    sat = 0.62 if (color_id % 2 == 0) else 0.80
+    val = 0.98 if (color_id % 3 != 0) else 0.86
+    return QColor.fromHsvF(h, sat, val)
+
+
 # ----------------------------------------------------------------------------
 # Internationalisation (English / Japanese)
 # ----------------------------------------------------------------------------
@@ -103,6 +112,9 @@ LANGUAGES = [("en", "English"), ("ja", "日本語")]
 STRINGS = {
     "app_title": {"en": "PHAROS BBox Editor",
                   "ja": "PHAROS BBox エディター"},
+    "textline_title": {"en": "Text Line BBox & Reading Order Corrector",
+                       "ja": "テキスト行 BBox・読み取り順コレクター"},
+    "line_n": {"en": "Line {n}", "ja": "行 {n}"},
     # toolbar
     "open_root": {"en": "📂 Open root…", "ja": "📂 ルートを開く"},
     "add_box": {"en": "➕ Add box", "ja": "➕ ボックス追加"},
@@ -142,6 +154,8 @@ STRINGS = {
                      "ja": "ページ   (✓ = 編集済み, bbox_gt あり)"},
     "boxes_header": {"en": "Bounding boxes (reading order)",
                      "ja": "バウンディングボックス (読み取り順)"},
+    "lines_header": {"en": "Text lines (reading order)",
+                     "ja": "テキスト行 (読み取り順)"},
     "move_up": {"en": "▲ Move up", "ja": "▲ 順番を上げる"},
     "move_down": {"en": "▼ Move down", "ja": "▼ 順番を下げる"},
     "edit_btn": {"en": "✏️ Edit…", "ja": "✏️ 変更…"},
@@ -277,6 +291,46 @@ def save_boxes(txt_path: Path, boxes: list[BBox]):
                         encoding="utf-8")
 
 
+def load_lines(txt_path: Path) -> list[BBox]:
+    """Load a 'text line' txt: each row is 'x1 y1 x2 y2 ... xn yn' (NO
+    category; 4 points in the original data). Row order = reading order.
+    Each line gets a stable colour id so it keeps its colour when reordered."""
+    boxes: list[BBox] = []
+    try:
+        text = txt_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return boxes
+    cid = 0
+    for row in text.splitlines():
+        parts = row.split()
+        if len(parts) < 6:
+            continue
+        try:
+            nums = [max(0, int(round(float(p)))) for p in parts]
+        except ValueError:
+            continue
+        if len(nums) % 2 == 1:
+            nums = nums[:-1]
+        pts = list(zip(nums[0::2], nums[1::2]))
+        if len(pts) < 3:
+            continue
+        boxes.append(BBox(cid, pts))   # category field reused as colour id
+        cid += 1
+    return boxes
+
+
+def save_lines(txt_path: Path, boxes: list[BBox]):
+    """Write text lines as 'x1 y1 ... xn yn' (NO category), one row per line,
+    in reading order."""
+    txt_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for b in boxes:
+        b.normalize()
+        rows.append(" ".join(f"{x} {y}" for x, y in b.points))
+    txt_path.write_text("\n".join(rows) + ("\n" if rows else ""),
+                        encoding="utf-8")
+
+
 def find_page_image(doc_dir: Path, stem: str) -> Path | None:
     """Find the page image; prefer the 'pages' folder."""
     for sub in IMG_SUBDIRS:
@@ -401,7 +455,7 @@ class BoxItem(QGraphicsPolygonItem):
         num = self.editor.order_number_of(self.box)
         picked = num is not None
         accent = QColor("#2ecc71")  # green = picked
-        base = category_color(self.box.category)
+        base = self.editor.box_color(self.box)
 
         if picked:
             pen = QPen(accent, self._scene_px(3.4))
@@ -463,7 +517,7 @@ class BoxItem(QGraphicsPolygonItem):
         if self.editor.order_mode:
             self._paint_order_mode(painter)
             return
-        color = category_color(self.box.category)
+        color = self.editor.box_color(self.box)
         poly = self.polygon()
         selected = self.isSelected()
         # "dim" = another box is selected, so this one steps back and hides
@@ -486,9 +540,30 @@ class BoxItem(QGraphicsPolygonItem):
         painter.setBrush(QBrush(fill))
         painter.drawPolygon(poly)
 
+        # Text-line mode: no full label, just a faint reading-order number.
+        if self.editor.textline_mode:
+            r = poly.boundingRect()
+            lpx = self.label_px * (1.0 if selected else 0.85)
+            font = QFont("Segoe UI", 1)
+            font.setPixelSize(max(10, int(lpx)))
+            font.setBold(True)
+            painter.setFont(font)
+            text = str(self.index + 1)
+            fm = painter.fontMetrics()
+            pad = self._scene_px(4)
+            tw = fm.horizontalAdvance(text)
+            th = fm.height()
+            pos = QRectF(r.left() + pad, r.top() + pad, tw, th)
+            alpha = 60 if dim else (210 if selected else 120)
+            tc = QColor("#10141a")
+            tc.setAlpha(alpha)
+            painter.setPen(tc)
+            painter.drawText(pos, Qt.AlignLeft | Qt.AlignVCenter, text)
+
         # Label (order + English category name). Hidden while dimmed so it
-        # never covers the content of the box being inspected.
-        if not dim:
+        # never covers the content of the box being inspected. Text-line mode
+        # has no labels at all.
+        if not dim and not self.editor.textline_mode:
             r = poly.boundingRect()
             lpx = self.label_px * (1.18 if selected else 1.0)
             font = QFont("Segoe UI", 1)
@@ -799,24 +874,28 @@ class BoxDialog(QDialog):
 
     def __init__(self, parent, title: str, n_boxes: int,
                  category: int = 0, order: int | None = None,
-                 allow_order_n_plus_1: bool = False):
+                 allow_order_n_plus_1: bool = False,
+                 show_category: bool = True):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(330)
         form = QFormLayout(self)
+        self.show_category = show_category
 
         # Category dropdown: "id — English name" (names are English only).
-        self.cat_combo = QComboBox()
-        self.cat_combo.setEditable(True)
-        self.cat_combo.setInsertPolicy(QComboBox.NoInsert)
-        for n in sorted(CATEGORY_NAMES):
-            self.cat_combo.addItem(f"{n} — {CATEGORY_NAMES[n]}", n)
-        idx = self.cat_combo.findData(category)
-        if idx >= 0:
-            self.cat_combo.setCurrentIndex(idx)
-        else:
-            self.cat_combo.setCurrentText(str(category))
-        form.addRow(tr("f_category"), self.cat_combo)
+        self.cat_combo = None
+        if show_category:
+            self.cat_combo = QComboBox()
+            self.cat_combo.setEditable(True)
+            self.cat_combo.setInsertPolicy(QComboBox.NoInsert)
+            for n in sorted(CATEGORY_NAMES):
+                self.cat_combo.addItem(f"{n} — {CATEGORY_NAMES[n]}", n)
+            idx = self.cat_combo.findData(category)
+            if idx >= 0:
+                self.cat_combo.setCurrentIndex(idx)
+            else:
+                self.cat_combo.setCurrentText(str(category))
+            form.addRow(tr("f_category"), self.cat_combo)
 
         max_order = max(1, n_boxes + (1 if allow_order_n_plus_1 else 0))
         self.order_spin = QSpinBox()
@@ -836,6 +915,8 @@ class BoxDialog(QDialog):
         form.addRow(buttons)
 
     def _parse_category(self) -> int:
+        if not self.show_category or self.cat_combo is None:
+            return 0
         idx = self.cat_combo.currentIndex()
         text = self.cat_combo.currentText().strip()
         if idx >= 0 and self.cat_combo.itemText(idx) == text:
@@ -852,7 +933,7 @@ class BoxDialog(QDialog):
 # ----------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, single=None):
+    def __init__(self, single=None, textline=None):
         super().__init__()
         self.resize(1480, 920)
 
@@ -861,6 +942,12 @@ class MainWindow(QMainWindow):
         self.single_image = self.single_res = self.single_gt = None
         if single:
             self.single_image, self.single_res, self.single_gt = single
+
+        # Text-line corrector mode: (image_path, lines_src, lines_gt)
+        self.textline_mode = textline is not None
+        self.textline_image = self.textline_src = self.textline_gt = None
+        if textline:
+            self.textline_image, self.textline_src, self.textline_gt = textline
 
         self.root: Path | None = None
         self.doc_dir: Path | None = None
@@ -891,6 +978,12 @@ class MainWindow(QMainWindow):
             self.act_prev.setVisible(False)
             self.act_next.setVisible(False)
             self._open_single()
+        elif self.textline_mode:
+            self.left_panel.hide()
+            self.act_open.setVisible(False)
+            self.act_prev.setVisible(False)
+            self.act_next.setVisible(False)
+            self._open_textline()
         else:
             default = Path(DEFAULT_ROOT)
             if default.is_dir():
@@ -1097,7 +1190,10 @@ class MainWindow(QMainWindow):
         self.retranslate()
 
     def retranslate(self):
-        if self.single_mode and self.single_gt is not None:
+        if self.textline_mode and self.textline_src is not None:
+            self.setWindowTitle(
+                f"{tr('textline_title')} — {self.textline_src.name}")
+        elif self.single_mode and self.single_gt is not None:
             self.setWindowTitle(f"{tr('app_title')} — {self.single_gt.name}")
         else:
             self.setWindowTitle(
@@ -1117,7 +1213,8 @@ class MainWindow(QMainWindow):
         self.search_edit.setPlaceholderText(tr("search_docs"))
         self.lbl_documents.setText(tr("documents"))
         self.lbl_pages.setText(tr("pages_header"))
-        self.lbl_boxes.setText(tr("boxes_header"))
+        self.lbl_boxes.setText(
+            tr("lines_header") if self.textline_mode else tr("boxes_header"))
         self.btn_up.setText(tr("move_up"))
         self.btn_down.setText(tr("move_down"))
         self.btn_edit.setText(tr("edit_btn"))
@@ -1210,20 +1307,58 @@ class MainWindow(QMainWindow):
                 tr("cannot_open_folder", e=self.single_res))
         self.load_page()
 
+    def _open_textline(self):
+        self.doc_dir = None
+        self.txt_name = self.textline_src.name
+        self.setWindowTitle(
+            f"{tr('textline_title')} — {self.textline_src.name}")
+        if not self.textline_src.exists():
+            QMessageBox.warning(
+                self, tr("err_title"),
+                tr("cannot_open_folder", e=self.textline_src))
+        self.load_page()
+
+    def box_color(self, box: BBox) -> QColor:
+        """Colour for a box: per-line colour in text-line mode, else by
+        category."""
+        if self.textline_mode:
+            return line_color(box.category)
+        return category_color(box.category)
+
     def load_page(self):
         if self.order_mode:
             self.order_mode = False
             self.order_seq = []
             self._set_order_checked(False)
-        if self.single_mode:
-            gt_path = self.single_gt
-            res_path = self.single_res
+        if self.textline_mode:
+            gt_path = self.textline_gt
+            res_path = self.textline_src
+            # lines_gt is the editable copy of lines_res: if it does not
+            # exist yet, seed it from lines_res so gt always carries res's
+            # content and edits accumulate into gt. (Never overwrites an
+            # existing gt, so a previous session is resumed.)
+            if not gt_path.exists() and res_path.exists():
+                try:
+                    gt_path.parent.mkdir(parents=True, exist_ok=True)
+                    gt_path.write_text(
+                        res_path.read_text(encoding="utf-8", errors="ignore"),
+                        encoding="utf-8")
+                except OSError as e:
+                    QMessageBox.warning(self, tr("save_err_title"),
+                                        tr("save_err_body", e=e))
+            src = gt_path if gt_path.exists() else res_path
+            self.boxes = load_lines(src)
+            self._src_state = "gt" if src == gt_path else "res"
         else:
-            gt_path = self.doc_dir / "bbox_gt" / self.txt_name
-            res_path = self.doc_dir / "bbox_res" / self.txt_name
-        src = gt_path if gt_path.exists() else res_path
-        self.boxes = load_boxes(src)
-        self._src_state = "gt" if src == gt_path else "res"
+            if self.single_mode:
+                gt_path = self.single_gt
+                res_path = self.single_res
+            else:
+                gt_path = self.doc_dir / "bbox_gt" / self.txt_name
+                res_path = self.doc_dir / "bbox_res" / self.txt_name
+            src = gt_path if gt_path.exists() else res_path
+            self.boxes = load_boxes(src)
+            self._src_state = "gt" if src == gt_path else "res"
         self._undo.clear()
         self._redo.clear()
         self.update_source_label()
@@ -1238,7 +1373,11 @@ class MainWindow(QMainWindow):
 
         stem = Path(self.txt_name).stem if self.txt_name else ""
         pix = None
-        if self.single_mode:
+        if self.textline_mode:
+            img = (self.textline_image
+                   if self.textline_image and self.textline_image.exists()
+                   else None)
+        elif self.single_mode:
             img = (self.single_image
                    if self.single_image and self.single_image.exists()
                    else None)
@@ -1285,11 +1424,16 @@ class MainWindow(QMainWindow):
         self._syncing = True
         self.box_list.clear()
         for i, b in enumerate(self.boxes):
-            it = QListWidgetItem(f"{i + 1}.  {category_name(b.category)}")
-            it.setForeground(category_color(b.category))
-            it.setToolTip(f"category {b.category} "
-                          f"({category_name(b.category)}), "
-                          f"{len(b.points)} points")
+            if self.textline_mode:
+                it = QListWidgetItem(tr("line_n", n=i + 1))
+                it.setForeground(line_color(b.category))
+                it.setToolTip(f"{len(b.points)} points")
+            else:
+                it = QListWidgetItem(f"{i + 1}.  {category_name(b.category)}")
+                it.setForeground(category_color(b.category))
+                it.setToolTip(f"category {b.category} "
+                              f"({category_name(b.category)}), "
+                              f"{len(b.points)} points")
             self.box_list.addItem(it)
         if select is not None and 0 <= select < self.box_list.count():
             self.box_list.setCurrentRow(select)
@@ -1385,22 +1529,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tr("redo_done"), 3000)
 
     def _save_only(self):
-        """Write the current boxes to bbox_gt without touching undo/redo."""
-        if self.single_mode:
+        """Write the current boxes to gt without touching undo/redo."""
+        if self.textline_mode:
+            gt_path = self.textline_gt
+        elif self.single_mode:
             gt_path = self.single_gt
         else:
             if self.doc_dir is None or self.txt_name is None:
                 return
             gt_path = self.doc_dir / "bbox_gt" / self.txt_name
         try:
-            save_boxes(gt_path, self.boxes)
+            (save_lines if self.textline_mode else save_boxes)(
+                gt_path, self.boxes)
         except OSError as e:
             QMessageBox.warning(self, tr("save_err_title"),
                                 tr("save_err_body", e=e))
             return
         self._src_state = "gt"
         self.update_source_label()
-        if not self.single_mode:
+        if not self.single_mode and not self.textline_mode:
             row = self.page_list.currentRow()
             if row >= 0:
                 it = self.page_list.item(row)
@@ -1506,21 +1653,24 @@ class MainWindow(QMainWindow):
     # ---- editing --------------------------------------------------------
 
     def autosave(self):
-        if self.single_mode:
+        if self.textline_mode:
+            gt_path = self.textline_gt
+        elif self.single_mode:
             gt_path = self.single_gt
         else:
             if self.doc_dir is None or self.txt_name is None:
                 return
             gt_path = self.doc_dir / "bbox_gt" / self.txt_name
         try:
-            save_boxes(gt_path, self.boxes)
+            (save_lines if self.textline_mode else save_boxes)(
+                gt_path, self.boxes)
         except OSError as e:
             QMessageBox.warning(self, tr("save_err_title"),
                                 tr("save_err_body", e=e))
             return
         self._src_state = "gt"
         self.update_source_label()
-        if not self.single_mode:
+        if not self.single_mode and not self.textline_mode:
             row = self.page_list.currentRow()
             if row >= 0:
                 it = self.page_list.item(row)
@@ -1542,10 +1692,14 @@ class MainWindow(QMainWindow):
     def add_box_from_rect(self, rect: QRectF):
         n = len(self.boxes)
         dlg = BoxDialog(self, tr("dlg_add_title"), n, category=0,
-                        order=n + 1, allow_order_n_plus_1=True)
+                        order=n + 1, allow_order_n_plus_1=True,
+                        show_category=not self.textline_mode)
         if dlg.exec() != QDialog.Accepted:
             return
         cat, order = dlg.values()
+        if self.textline_mode:
+            # assign a fresh, unused colour id so the new line is distinct
+            cat = (max((b.category for b in self.boxes), default=-1) + 1)
         self.push_undo()
         pts = [(rect.left(), rect.top()), (rect.right(), rect.top()),
                (rect.right(), rect.bottom()), (rect.left(), rect.bottom())]
@@ -1564,9 +1718,11 @@ class MainWindow(QMainWindow):
         if idx is None or idx < 0 or idx >= len(self.boxes):
             return
         b = self.boxes[idx]
+        name = (tr("line_n", n=idx + 1) if self.textline_mode
+                else category_name(b.category))
         ret = QMessageBox.question(
             self, tr("del_title"),
-            tr("del_body", i=idx + 1, name=category_name(b.category)))
+            tr("del_body", i=idx + 1, name=name))
         if ret != QMessageBox.Yes:
             return
         self.push_undo()
@@ -1592,12 +1748,14 @@ class MainWindow(QMainWindow):
             return
         b = self.boxes[index]
         dlg = BoxDialog(self, tr("dlg_edit_title"), len(self.boxes),
-                        category=b.category, order=index + 1)
+                        category=b.category, order=index + 1,
+                        show_category=not self.textline_mode)
         if dlg.exec() != QDialog.Accepted:
             return
         cat, order = dlg.values()
         self.push_undo()
-        b.category = cat
+        if not self.textline_mode:
+            b.category = cat   # keep the stable colour id in text-line mode
         new = order - 1
         if new != index:
             self.boxes.insert(new, self.boxes.pop(index))
@@ -1678,26 +1836,42 @@ def main():
                         help="Model output txt (read-only, never modified)")
     parser.add_argument("--bbox_gt", dest="bbox_gt", metavar="FILE",
                         help="Corrected output txt (edits are written here)")
+    parser.add_argument("--lines_res", "--lines", "--line_txt",
+                        dest="lines_res", metavar="FILE",
+                        help="Text-line source txt (4 points per line, no "
+                             "category; read-only). Use with --image and "
+                             "--lines_gt for the Text Line corrector.")
+    parser.add_argument("--lines_gt", dest="lines_gt", metavar="FILE",
+                        help="Corrected text-line output txt "
+                             "(edits are written here).")
     args, _ = parser.parse_known_args()
 
     given = [args.image, args.box_res, args.bbox_gt]
     n_given = sum(x is not None for x in given)
+    has_lines = bool(args.lines_res or args.lines_gt)
 
     app = QApplication(sys.argv)
     app.setApplicationName("PHAROS BBox Editor")
 
-    if n_given == 3:
+    if (args.image and args.lines_res and args.lines_gt
+            and not args.box_res and not args.bbox_gt):
+        # Text Line Bounding Box & Reading Order corrector
+        # (image + lines_res + lines_gt). lines_res is read-only;
+        # edits are written to lines_gt.
+        win = MainWindow(textline=(Path(args.image),
+                                   Path(args.lines_res),
+                                   Path(args.lines_gt)))
+    elif n_given == 3 and not has_lines:
         single = (Path(args.image), Path(args.box_res), Path(args.bbox_gt))
         win = MainWindow(single=single)
-    elif n_given == 0:
+    elif n_given == 0 and not has_lines:
         win = MainWindow()
     else:
-        missing = [name for name, val in
-                   (("--image", args.image), ("--box_res", args.box_res),
-                    ("--bbox_gt", args.bbox_gt)) if val is None]
-        print("Provide either all three of --image, --box_res, --bbox_gt "
-              "(single-page mode) or none (folder mode).\n"
-              f"Missing: {', '.join(missing)}", file=sys.stderr)
+        print("Use one of:\n"
+              "  (no arguments)                       -> folder browser\n"
+              "  --image --box_res --bbox_gt          -> single bbox page\n"
+              "  --image --lines_res --lines_gt       -> text-line corrector",
+              file=sys.stderr)
         sys.exit(2)
 
     win.showMaximized()
